@@ -10,7 +10,8 @@
                     03/04/09 [Nathan Seidle] 
                     02/24/11 [Jim Lindblom]
                     original alarm clock software
-    
+					New display ISR
+					New timing ISR
  
  Description:
  Convert Clockit into a stop watch. 
@@ -170,6 +171,14 @@
 
 #define FOSC 16000000 //16MHz crystal
 
+// button states
+#define UP 1
+#define DOWN 0
+
+// switch states
+#define ON 1
+#define OFF 0
+
 // Common anodes
 #define DIG_1   PORTD0
 #define DIG_2   PORTD1
@@ -191,17 +200,24 @@
 #define APOS_C  PORTC1
 
 // Buttons
-#define BUT_START   PORTB5
-#define BUT_STOP    PORTB4
-#define BUT_RESET   PORTD7
-#define SW_ALARM    PORTB0
+#define BUT_UP     PORTB5
+#define BUT_DOWN   PORTB4
+#define BUT_SNOOZE PORTD7
+#define SW_ALARM   PORTB0
 
 #define BUZZ1   PORTB1
 #define BUZZ2   PORTB2
 
-#define RESET 0
-#define RUN 1
-#define STOP 2
+// Major/Minor CLOCK states
+#define CLOCK 0 // Clock Mode
+#define H12 0   // 12-hour AM/PM
+#define H24 1   // 24-hour
+#define SS 2    // MM:SS
+
+#define SET 1   // Set Mode
+#define CLK 0   // Clock set
+#define ALM 1   // Alarm set
+#define ACC 2   // Accuracy adjust +/- 128 ppm
 
 #define MAX_BRIGHT 200
 
@@ -212,27 +228,35 @@
 void ioinit (void);
 void clear_display(void);
 void settime(uint8_t h24,uint8_t m1,uint8_t m0,uint8_t s1,uint8_t s0,uint16_t sms);
+void displaytime(void);
 
 //Global Variables
 volatile uint8_t digit=0;  // currently displayed digit 0-3 or 4 for : and '
 volatile uint8_t digit_val[5]={0,0,0,0,0xF0};  // currently displayed digit 0-3 or 4 for : and '
 volatile uint8_t dp=0x00;  // currently displayed decimal point bitmap 0bxxxx3210
+volatile uint8_t blink=OFF;  // blinking?
+volatile uint8_t dispcount=0;  // number of times display refreshed mod 256
 
-volatile uint8_t mils[MSDIG]; // 1/1000 of sec 7 digits mils[0]=1/1000,mils[1]=1/100 etc
+
 volatile uint8_t ss[2]={0,0}; // Seconds
 volatile uint8_t mm[2]={0,0}; // minutes
 volatile uint8_t hh=0; // hours
 volatile uint8_t ampm=0x00; 
 volatile uint16_t ms=0; 
 
+volatile uint8_t state=CLOCK;      // state of clock: CLOCK, SET
+volatile uint8_t substate=0x01;   // state of clock: *CLOCK(*H12,H24,SS), SET(CLK,ALM,ACC)
 
-volatile uint8_t state=RESET;      // state of timer: RESET, RUN, STOP, SETUP
- 
+volatile uint8_t snooze_state=UP;  // state of snooze button 
+volatile uint8_t snooze_count=0;  // state of snooze button 
+
+
 //Main
 int main (void){
     ioinit(); //Initialize IO
-	settime(13,2,0,0,0,0); // instant settime(hh24,m,m,s,s,ms)
-    
+ 	settime(10+12,5,7,0,0,0); // instant settime(hh24,m,m,s,s,ms)
+    displaytime();
+	
     while(1){
     }
     
@@ -249,8 +273,10 @@ ISR (TIMER2_OVF_vect){
 
     digit++;// Rotate digit each cycle
     if(digit>4){
-     digit=0;
+		digit=0;
+		dispcount++;
     }
+	if ((blink==ON) && bit_is_set(dispcount,5)) digit=5;
     switch(digit) {
         case 0:
             PORTD |= _BV(DIG_1); // DIGIT1 anode on=1
@@ -337,23 +363,11 @@ ISR (TIMER2_COMPA_vect){
 
 // 1ms clock
 ISR (TIMER1_CAPT_vect) {
-    uint8_t n,C,h12;
-    
-	C=1;
-    mils[0]++;
-    for(n=0;n<MSDIG-1 && C==1;n++){
-        C=0;
-        if(mils[n]==10){
-            C=1;
-            mils[n]=0;
-            mils[n+1]++;
-        }
-    }
-	
+
 	ms++;
-	if(ms==500) digit_val[4]&=~(_BV(0)); //unset colon
+	if(ms==500)	digit_val[4]&=~(_BV(0)); //set colon
 	if(ms==1000){
-		digit_val[4]|=_BV(0); //set colon
+		digit_val[4]|=_BV(0); //unset colon
 		ms=0;
 		ss[0]++;
 		if(ss[0]==10){
@@ -371,33 +385,48 @@ ISR (TIMER1_CAPT_vect) {
 						if(hh==24) hh=0;
 						if (hh<12){
 							ampm = 0x00;
-							digit_val[4] &=~(_BV(1)); // unset APOS
-							h12=hh;
 						}else{							
 							ampm = 0x01;
-							digit_val[4] |=_BV(1);  // set APOS
-							h12=hh-12;
-						}
-						if(h12==0) h12=12;
-						if(h12<10){
-							digit_val[0]=0xf;
-							digit_val[1]=h12;
-						}else{
-							digit_val[0]=1;
-							digit_val[1]=h12-10;
 						}
 					}						
-					digit_val[2]=mm[1];
 				}
-				digit_val[3]=mm[0];
+				// 1 min tasks
+				displaytime();
 			}
 		}
+		// 1 sec tasks 
+		if(bit_is_set(substate,SS)) displaytime();
+		if(snooze_state==DOWN){
+			snooze_count++;
+		}else{
+			snooze_count=0;
+		}
+		if((state==CLOCK) && (snooze_count>1)){
+			state=SET;
+			blink=ON;
+		}
+		if(state==SET){
+			dp|=_BV(0);
+		}else{
+			dp&=~(_BV(0));
+		}
 	}
+	
 }
 								
 
-ISR(PCINT0_vect){ // START, STOP, ALARM change state
-    
+ISR(PCINT0_vect){ // PROCESS(PINB) UP, DOWN, ALARM
+	
+	if (state==CLOCK){
+		if(bit_is_clear(PINB,BUT_UP)){
+			if(OCR2A<MAX_BRIGHT-4) OCR2A+=5;
+        }           
+		if(bit_is_clear(PINB,BUT_DOWN)){
+            if(OCR2A>4) OCR2A-=5;
+        }         
+	}
+
+  /*  
     if(bit_is_set(PINB,BUT_START)){
         digit_val[4] &=~(_BV(0));
     }else{
@@ -421,33 +450,36 @@ ISR(PCINT0_vect){ // START, STOP, ALARM change state
             state=RUN;
         }
     }
-
+ */
 }
 
-ISR(PCINT2_vect){ // RESET button changed state
-    uint8_t n;
+ISR(PCINT2_vect){ // PROCESS SNOOZE(PIND) 
+
+	if(bit_is_clear(PIND,BUT_SNOOZE)){ // button press
+		snooze_state=DOWN;
+		if(state==SET){
+			state=CLOCK;
+			blink=OFF;
+		}
+	}
+
+	// toggle mm:ss mode on button release
+	if(bit_is_set(PIND,BUT_SNOOZE)){ // button release
+		snooze_state=UP;
+		if(state==CLOCK){
+			if(bit_is_set(substate,SS)){
+				substate&=~(_BV(SS));
+			}else{
+				substate|=_BV(SS);
+			}
+		}
+	}
+	displaytime();
+
+	/*
+ uint8_t n;
     
-    if(bit_is_clear(PIND,BUT_RESET)){
-        if(state==RESET){
-            if(bit_is_set(PINB,SW_ALARM)){
-                if(OCR2A<MAX_BRIGHT-4){
-                    OCR2A+=5;
-                }
-            }else{
-                if(OCR2A>4){
-                    OCR2A-=5;
-                }
-            }
-        }           
-        state=RESET;
-        dp=0x01;
-        for(n=0;n<MSDIG;n++){
-            mils[n]=0;
-        }
-        for(n=0;n<4;n++){
-            digit_val[n]=0;
-        }
-    }
+*/
 }
 
 //Functions
@@ -459,7 +491,6 @@ void clear_display(void) {
 }
 
 void settime(uint8_t h24,uint8_t m1,uint8_t m0,uint8_t s1,uint8_t s0,uint16_t sms){
-	uint8_t h12;
 	
 	// set variables
 	if(h24>11){
@@ -473,37 +504,55 @@ void settime(uint8_t h24,uint8_t m1,uint8_t m0,uint8_t s1,uint8_t s0,uint16_t sm
 	ss[0]=s0;
 	ss[1]=s1;
 	ms=sms;
-	
-	// set display 
-	if (hh<12) {
-		digit_val[4] &=~(_BV(1)); // unset APOS
-		h12=hh;
-	}else{							
-		digit_val[4] |=_BV(1);  // set APOS
-		h12=hh-12;
-	}
-	if (h12==0) h12=12;
-	if(h12<10){
-		digit_val[0]=0xf;
-		digit_val[1]=h12;
-	}else{
-		digit_val[0]=1;
-		digit_val[1]=h12-10;
-	}										
-	digit_val[2]=mm[1];
-	digit_val[3]=mm[0];
+}
+void displaytime(void){
+	uint8_t h12;
+	// set display
 
+	//if (state==CLOCK){  // Clock Mode
+		if (bit_is_clear(substate,SS)){  //Not mm:ss  
+			if (bit_is_set(substate,H12)){  // AMPM mode
+				if (hh<12) {
+					digit_val[4] &=~(_BV(1)); // unset APOS
+					h12=hh;
+				}else{							
+					digit_val[4] |=_BV(1);  // set APOS
+					h12=hh-12;
+				}
+				if (h12==0) h12=12;
+			}else{
+				h12=hh;
+			}
+			if(h12<10) {
+				digit_val[0]=0xf;
+				digit_val[1]=h12;
+			}else if(h12<20) {
+				digit_val[0]=1;
+				digit_val[1]=h12-10;
+			}else{
+				digit_val[0]=2;
+				digit_val[1]=h12-20;
+			}										
+			digit_val[2]=mm[1];
+			digit_val[3]=mm[0];
+		}else{
+			digit_val[0]=mm[1];
+			digit_val[1]=mm[0];
+			digit_val[2]=ss[1];
+			digit_val[3]=ss[0];
+		}
+	//}
 }
 
 void ioinit(void){
 
     // Setup IO; 1 = output, 0 = input 
-    DDRB = 0b11111111 & ~(_BV(BUT_START)|_BV(BUT_STOP)|_BV(SW_ALARM));   
+    DDRB = 0b11111111 & ~(_BV(BUT_UP)|_BV(BUT_DOWN)|_BV(SW_ALARM));   
     DDRC = 0b11111111; // LED output
-    DDRD = 0b11111111 & ~(_BV(BUT_RESET)); 
+    DDRD = 0b11111111 & ~(_BV(BUT_SNOOZE)); 
     
 
-    PORTB = _BV(BUT_START)|_BV(BUT_STOP)|_BV(SW_ALARM); //Enable pull-ups
+    PORTB = _BV(BUT_UP)|_BV(BUT_DOWN)|_BV(SW_ALARM); //Enable pull-ups
     PORTD = 0b10100100; //Enable pull-up on reset button
     PORTC = 0b00111111;
 
